@@ -83,7 +83,7 @@ class UpdateTests : DatabaseTestsBase() {
         }
     }
 
-    @Test(expected = IllegalArgumentException::class)
+    @Test
     fun `test that column length checked in update `() {
         val stringTable = object : IntIdTable("StringTable") {
             val name = varchar("name", 10)
@@ -95,9 +95,23 @@ class UpdateTests : DatabaseTestsBase() {
             }
 
             val veryLongString = "1".repeat(255)
-            stringTable.update({ stringTable.name eq "TestName" }) {
-                it[name] = veryLongString
+            expectException<IllegalArgumentException> {
+                stringTable.update({ stringTable.name eq "TestName" }) {
+                    it[name] = veryLongString
+                }
             }
+        }
+    }
+
+    @Test
+    fun `test update fails with empty body`() {
+        withCitiesAndUsers { cities, _, _ ->
+            expectException<IllegalArgumentException> {
+                cities.update(where = { cities.id.isNull() }) {
+                    // empty
+                }
+            }
+
         }
     }
 }

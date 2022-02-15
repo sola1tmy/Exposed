@@ -2,14 +2,30 @@ package org.jetbrains.exposed.sql
 
 import org.jetbrains.exposed.sql.transactions.TransactionManager
 import org.jetbrains.exposed.sql.vendors.*
-import java.util.*
+import java.math.BigDecimal
 
 object SchemaUtils {
-    private class TableDepthGraph(val tables: List<Table>) {
-        val graph = fetchAllTables().associate { t ->
-            t to t.columns.mapNotNull { c ->
-                c.referee?.let { it.table to c.columnType.nullable }
-            }.toMap()
+    private inline fun <R> logTimeSpent(message: String, withLogs: Boolean, block: () -> R): R {
+        return if (withLogs) {
+            val start = System.currentTimeMillis()
+            val answer = block()
+            exposedLogger.info(message + " took " + (System.currentTimeMillis() - start) + "ms")
+            answer
+        } else {
+            block()
+        }
+    }
+
+    private class TableDepthGraph(val tables: Iterable<Table>) {
+        val graph = fetchAllTables().let { tables ->
+            if (tables.isEmpty()) emptyMap()
+            else {
+                tables.associateWith { t ->
+                    t.columns.mapNotNull { c ->
+                        c.referee?.let { it.table to c.columnType.nullable }
+                    }.toMap()
+                }
+            }
         }
 
         private fun fetchAllTables(): HashSet<Table> {
@@ -27,6 +43,8 @@ object SchemaUtils {
         }
 
         fun sorted(): List<Table> {
+            if (!tables.iterator().hasNext()) return emptyList()
+
             val visited = mutableSetOf<Table>()
             val result = arrayListOf<Table>()
 
@@ -47,6 +65,7 @@ object SchemaUtils {
         }
 
         fun hasCycle(): Boolean {
+            if (!tables.iterator().hasNext()) return false
             val visited = mutableSetOf<Table>()
             val recursion = mutableSetOf<Table>()
 
@@ -68,12 +87,11 @@ object SchemaUtils {
         }
     }
 
-    fun sortTablesByReferences(tables: Iterable<Table>) = TableDepthGraph(tables.toList()).sorted()
+    fun sortTablesByReferences(tables: Iterable<Table>) = TableDepthGraph(tables).sorted()
     fun checkCycle(vararg tables: Table) = TableDepthGraph(tables.toList()).hasCycle()
 
     fun createStatements(vararg tables: Table): List<String> {
-        if (tables.isEmpty())
-            return emptyList()
+        if (tables.isEmpty()) return emptyList()
 
         val toCreate = sortTablesByReferences(tables.toList()).filterNot { it.exists() }
         val alters = arrayListOf<String>()
@@ -99,21 +117,67 @@ object SchemaUtils {
         }
     }
 
+    @Deprecated(
+        "Will be removed in upcoming releases. Please use overloaded version instead",
+        ReplaceWith("createFKey(checkNotNull(reference.foreignKey) { \"${"$"}reference does not reference anything\" })"),
+        DeprecationLevel.WARNING
+    )
     fun createFKey(reference: Column<*>): List<String> {
         val foreignKey = reference.foreignKey
         require(foreignKey != null && (foreignKey.deleteRule != null || foreignKey.updateRule != null)) { "$reference does not reference anything" }
-        return foreignKey.createStatement()
+        return createFKey(foreignKey)
+    }
+
+    fun createFKey(foreignKey: ForeignKeyConstraint): List<String> = with(foreignKey) {
+        val allFromColumnsBelongsToTheSameTable = from.all { it.table == fromTable }
+        require(allFromColumnsBelongsToTheSameTable) { "not all referencing columns of $foreignKey belong to the same table" }
+        val allTargetColumnsBelongToTheSameTable = target.all { it.table == targetTable }
+        require(allTargetColumnsBelongToTheSameTable) { "not all referenced columns of $foreignKey belong to the same table" }
+        require(from.size == target.size) { "$foreignKey referencing columns are not in accordance with referenced" }
+        require(deleteRule != null || updateRule != null) { "$foreignKey has no reference constraint actions" }
+        require(target.toHashSet().size == target.size) { "not all referenced columns of $foreignKey are unique" }
+
+        return createStatement()
     }
 
     fun createIndex(index: Index) = index.createStatement()
 
-    fun addMissingColumnsStatements(vararg tables: Table): List<String> {
+    @Suppress("NestedBlockDepth", "ComplexMethod")
+    private fun DataTypeProvider.dbDefaultToString(exp: Expression<*>): String {
+        return when (exp) {
+            is LiteralOp<*> -> when (exp.value) {
+                is Boolean -> when (currentDialect) {
+                    is MysqlDialect -> if (exp.value) "1" else "0"
+                    is PostgreSQLDialect -> exp.value.toString()
+                    else -> booleanToStatementString(exp.value)
+                }
+                is String -> when (currentDialect) {
+                    is PostgreSQLDialect -> "${exp.value}'::character varying"
+                    else -> exp.value
+                }
+                is Enum<*> -> when (exp.columnType) {
+                    is EnumerationNameColumnType<*> -> when (currentDialect) {
+                        is PostgreSQLDialect -> "${exp.value.name}'::character varying"
+                        else -> exp.value.name
+                    }
+                    else -> processForDefaultValue(exp)
+                }
+                is BigDecimal -> when (currentDialect) {
+                    is MysqlDialect -> exp.value.setScale((exp.columnType as DecimalColumnType).scale).toString()
+                    else -> processForDefaultValue(exp)
+                }
+                else -> processForDefaultValue(exp)
+            }
+            else -> processForDefaultValue(exp)
+        }
+    }
+
+    fun addMissingColumnsStatements(vararg tables: Table, withLogs: Boolean = true): List<String> {
         with(TransactionManager.current()) {
             val statements = ArrayList<String>()
-            if (tables.isEmpty())
-                return statements
+            if (tables.isEmpty()) return statements
 
-            val existingTableColumns = logTimeSpent("Extracting table columns") {
+            val existingTableColumns = logTimeSpent("Extracting table columns", withLogs) {
                 currentDialect.tableColumns(*tables)
             }
 
@@ -132,38 +196,41 @@ object SchemaUtils {
                     }
 
                     // sync existing columns
-                    val redoColumn = table.columns.filter { c ->
-                        thisTableExistingColumns.any {
-                            if (c.name.equals(it.name, true)) {
-                                val incorrectNullability = it.nullable != c.columnType.nullable
-                                val incorrectAutoInc = it.autoIncrement != c.columnType.isAutoInc
-                                incorrectNullability || incorrectAutoInc
-                            } else false
+                    val dataTypeProvider = db.dialect.dataTypeProvider
+                    val redoColumn = table.columns.mapNotNull { c ->
+                        val changedState = thisTableExistingColumns.find { c.name.equals(it.name, true) }?.let {
+                            val incorrectNullability = it.nullable != c.columnType.nullable
+                            val incorrectAutoInc = it.autoIncrement != c.columnType.isAutoInc
+                            val incorrectDefaults =
+                                it.defaultDbValue != c.dbDefaultValue?.let { dataTypeProvider.dbDefaultToString(it) }
+                            val incorrectCaseSensitiveName = it.name.inProperCase() != c.nameInDatabaseCase()
+                            ColumnDiff(incorrectNullability, incorrectAutoInc, incorrectDefaults, incorrectCaseSensitiveName)
                         }
+
+                        changedState?.takeIf { it.hasDifferences() }?.let { c to changedState }
                     }
-                    redoColumn.flatMapTo(statements) { it.modifyStatement() }
+                    redoColumn.flatMapTo(statements) { (col, changedState) ->
+                        col.modifyStatements(changedState)
+                    }
                 }
             }
 
             if (db.supportsAlterTableWithAddColumn) {
-                val existingColumnConstraint = logTimeSpent("Extracting column constraints") {
+                val existingColumnConstraint = logTimeSpent("Extracting column constraints", withLogs) {
                     db.dialect.columnConstraints(*tables)
                 }
 
                 for (table in tables) {
-                    for (column in table.columns) {
-                        val foreignKey = column.foreignKey
-                        if (foreignKey != null) {
-                            val existingConstraint = existingColumnConstraint[table to column]?.firstOrNull()
-                            if (existingConstraint == null) {
-                                statements.addAll(createFKey(column))
-                            } else if (existingConstraint.target.table != foreignKey.target.table ||
-                                foreignKey.deleteRule != existingConstraint.deleteRule ||
-                                foreignKey.updateRule != existingConstraint.updateRule
-                            ) {
-                                statements.addAll(existingConstraint.dropStatement())
-                                statements.addAll(createFKey(column))
-                            }
+                    for (foreignKey in table.foreignKeys) {
+                        val existingConstraint = existingColumnConstraint[table to foreignKey.from]?.firstOrNull()
+                        if (existingConstraint == null) {
+                            statements.addAll(createFKey(foreignKey))
+                        } else if (existingConstraint.targetTable != foreignKey.targetTable ||
+                            foreignKey.deleteRule != existingConstraint.deleteRule ||
+                            foreignKey.updateRule != existingConstraint.updateRule
+                        ) {
+                            statements.addAll(existingConstraint.dropStatement())
+                            statements.addAll(createFKey(foreignKey))
                         }
                     }
                 }
@@ -174,14 +241,15 @@ object SchemaUtils {
     }
 
     private fun Transaction.execStatements(inBatch: Boolean, statements: List<String>) {
-        if (inBatch)
+        if (inBatch) {
             execInBatch(statements)
-        else {
+        } else {
             for (statement in statements) {
                 exec(statement)
             }
         }
     }
+
     fun <T : Table> create(vararg tables: T, inBatch: Boolean = false) {
         with(TransactionManager.current()) {
             execStatements(inBatch, createStatements(*tables))
@@ -232,32 +300,160 @@ object SchemaUtils {
      * To prevent such cases is advised to use any "global" synchronization you prefer (via redis, memcached, etc) or
      * with Exposed's provided lock based on synchronization on a dummy "Buzy" table (@see SchemaUtils#withDataBaseLock).
      */
-    fun createMissingTablesAndColumns(vararg tables: Table, inBatch: Boolean = false) {
+    fun createMissingTablesAndColumns(vararg tables: Table, inBatch: Boolean = false, withLogs: Boolean = true) {
         with(TransactionManager.current()) {
             db.dialect.resetCaches()
-            val createStatements = logTimeSpent("Preparing create tables statements") {
+            val createStatements = logTimeSpent("Preparing create tables statements", withLogs) {
                 createStatements(*tables)
             }
-            logTimeSpent("Executing create tables statements") {
+            logTimeSpent("Executing create tables statements", withLogs) {
                 execStatements(inBatch, createStatements)
                 commit()
             }
 
-            val alterStatements = logTimeSpent("Preparing alter table statements") {
-                addMissingColumnsStatements(*tables)
+            val alterStatements = logTimeSpent("Preparing alter table statements", withLogs) {
+                addMissingColumnsStatements(tables = tables, withLogs)
             }
-            logTimeSpent("Executing alter table statements") {
+            logTimeSpent("Executing alter table statements", withLogs) {
                 execStatements(inBatch, alterStatements)
                 commit()
             }
             val executedStatements = createStatements + alterStatements
-            logTimeSpent("Checking mapping consistence") {
-                val modifyTablesStatements = checkMappingConsistence(*tables).filter { it !in executedStatements }
+            logTimeSpent("Checking mapping consistence", withLogs) {
+                val modifyTablesStatements = checkMappingConsistence(tables = tables, withLogs).filter { it !in executedStatements }
                 execStatements(inBatch, modifyTablesStatements)
                 commit()
             }
             db.dialect.resetCaches()
         }
+    }
+
+    /**
+     * The function provides a list of statements those need to be executed to make
+     * existing table definition compatible with Exposed tables mapping.
+     */
+    fun statementsRequiredToActualizeScheme(vararg tables: Table, withLogs: Boolean = true): List<String> {
+        val (tablesToCreate, tablesToAlter) = tables.partition { !it.exists() }
+        val createStatements = logTimeSpent("Preparing create tables statements", withLogs) {
+            createStatements(tables = tablesToCreate.toTypedArray())
+        }
+        val alterStatements = logTimeSpent("Preparing alter table statements", withLogs) {
+            addMissingColumnsStatements(tables = tablesToAlter.toTypedArray(), withLogs)
+        }
+        val executedStatements = createStatements + alterStatements
+        val modifyTablesStatements = logTimeSpent("Checking mapping consistence", withLogs) {
+            checkMappingConsistence(tables = tablesToAlter.toTypedArray(), withLogs).filter { it !in executedStatements }
+        }
+        return executedStatements + modifyTablesStatements
+    }
+
+    /**
+     * Log Exposed table mappings <-> real database mapping problems and returns DDL Statements to fix them
+     */
+    fun checkMappingConsistence(vararg tables: Table, withLogs: Boolean = true): List<String> {
+        if (withLogs) {
+            checkExcessiveIndices(tables = tables)
+        }
+        return checkMissingIndices(tables = tables, withLogs).flatMap { it.createStatement() }
+    }
+
+    fun checkExcessiveIndices(vararg tables: Table) {
+        val excessiveConstraints = currentDialect.columnConstraints(*tables).filter { it.value.size > 1 }
+
+        if (excessiveConstraints.isNotEmpty()) {
+            exposedLogger.warn("List of excessive foreign key constraints:")
+            excessiveConstraints.forEach { (pair, fk) ->
+                val constraint = fk.first()
+                val fkPartToLog = fk.joinToString(", ") { it.fkName }
+                exposedLogger.warn(
+                    "\t\t\t'${pair.first}'.'${pair.second}' -> '${constraint.fromTableName}':\t$fkPartToLog"
+                )
+            }
+
+            exposedLogger.info("SQL Queries to remove excessive keys:")
+            excessiveConstraints.forEach { (_, value) ->
+                value.take(value.size - 1).forEach {
+                    exposedLogger.info("\t\t\t${it.dropStatement()};")
+                }
+            }
+        }
+
+        val excessiveIndices =
+            currentDialect.existingIndices(*tables).flatMap { it.value }.groupBy { Triple(it.table, it.unique, it.columns.joinToString { it.name }) }
+                .filter { it.value.size > 1 }
+        if (excessiveIndices.isNotEmpty()) {
+            exposedLogger.warn("List of excessive indices:")
+            excessiveIndices.forEach { (triple, indices) ->
+                exposedLogger.warn("\t\t\t'${triple.first.tableName}'.'${triple.third}' -> ${indices.joinToString(", ") { it.indexName }}")
+            }
+            exposedLogger.info("SQL Queries to remove excessive indices:")
+            excessiveIndices.forEach {
+                it.value.take(it.value.size - 1).forEach {
+                    exposedLogger.info("\t\t\t${it.dropStatement()};")
+                }
+            }
+        }
+    }
+
+    /** Returns list of indices missed in database **/
+    private fun checkMissingIndices(vararg tables: Table, withLogs: Boolean): List<Index> {
+        fun Collection<Index>.log(mainMessage: String) {
+            if (withLogs && isNotEmpty()) {
+                exposedLogger.warn(mainMessage)
+                forEach {
+                    exposedLogger.warn("\t\t$it")
+                }
+            }
+        }
+
+        val isMysql = currentDialect is MysqlDialect
+        val isSQLite = currentDialect is SQLiteDialect
+        val fKeyConstraints = currentDialect.columnConstraints(*tables).keys
+        val existingIndices = currentDialect.existingIndices(*tables)
+        fun List<Index>.filterFKeys() = if (isMysql) {
+            filterNot { it.table to LinkedHashSet(it.columns) in fKeyConstraints }
+        } else {
+            this
+        }
+
+        // SQLite: indices whose names start with "sqlite_" are meant for internal use
+        fun List<Index>.filterInternalIndices() = if (isSQLite) {
+            filter { !it.indexName.startsWith("sqlite_") }
+        } else {
+            this
+        }
+
+        val missingIndices = HashSet<Index>()
+        val notMappedIndices = HashMap<String, MutableSet<Index>>()
+        val nameDiffers = HashSet<Index>()
+
+        for (table in tables) {
+            val existingTableIndices = existingIndices[table].orEmpty().filterFKeys().filterInternalIndices()
+            val mappedIndices = table.indices.filterFKeys().filterInternalIndices()
+
+            existingTableIndices.forEach { index ->
+                mappedIndices.firstOrNull { it.onlyNameDiffer(index) }?.let {
+                    if (withLogs) {
+                        exposedLogger.info(
+                            "Index on table '${table.tableName}' differs only in name: in db ${index.indexName} -> in mapping ${it.indexName}"
+                        )
+                    }
+                    nameDiffers.add(index)
+                    nameDiffers.add(it)
+                }
+            }
+
+            notMappedIndices.getOrPut(table.nameInDatabaseCase()) { hashSetOf() }.addAll(existingTableIndices.subtract(mappedIndices))
+
+            missingIndices.addAll(mappedIndices.subtract(existingTableIndices))
+        }
+
+        val toCreate = missingIndices.subtract(nameDiffers)
+        toCreate.log("Indices missed from database (will be created):")
+        notMappedIndices.forEach { (name, indexes) ->
+            indexes.subtract(nameDiffers).log("Indices exist in database and not mapped in code on class '$name':")
+        }
+        return toCreate.toList()
     }
 
     /**

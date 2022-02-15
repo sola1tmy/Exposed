@@ -4,9 +4,11 @@ import org.jetbrains.exposed.sql.transactions.TransactionManager
 import org.jetbrains.exposed.sql.vendors.withDialect
 import java.sql.ResultSet
 
-class ResultRow(val fieldIndex: Map<Expression<*>, Int>) {
+class ResultRow(
+    val fieldIndex: Map<Expression<*>, Int>,
+    private val data: Array<Any?> = arrayOfNulls<Any?>(fieldIndex.size)
+) {
     private val database: Database? = TransactionManager.currentOrNull()?.db
-    private val data = arrayOfNulls<Any?>(fieldIndex.size)
 
     /**
      * Retrieves value of a given expression on this row.
@@ -42,9 +44,6 @@ class ResultRow(val fieldIndex: Map<Expression<*>, Int>) {
 
     fun <T> getOrNull(c: Expression<T>): T? = if (hasValue(c)) rawToColumnValue(getRaw(c), c) else null
 
-    @Deprecated("Replaced with getOrNull to be more kotlinish", replaceWith = ReplaceWith("getOrNull(c)"))
-    fun <T> tryGet(c: Expression<T>): T? = getOrNull(c)
-
     @Suppress("UNCHECKED_CAST")
     private fun <T> rawToColumnValue(raw: T?, c: Expression<T>): T {
         return when {
@@ -52,6 +51,7 @@ class ResultRow(val fieldIndex: Map<Expression<*>, Int>) {
             raw == NotInitializedValue -> error("$c is not initialized yet")
             c is ExpressionAlias<T> && c.delegate is ExpressionWithColumnType<T> -> c.delegate.columnType.valueFromDB(raw)
             c is ExpressionWithColumnType<T> -> c.columnType.valueFromDB(raw)
+            c is Op.OpBoolean -> BooleanColumnType.INSTANCE.valueFromDB(raw)
             else -> raw
         } as T
     }
@@ -65,8 +65,13 @@ class ResultRow(val fieldIndex: Map<Expression<*>, Int>) {
 
         val index = fieldIndex[c]
             ?: ((c as? Column<*>)?.columnType as? EntityIDColumnType<*>)?.let { fieldIndex[it.idColumn] }
-            ?: fieldIndex.keys.firstOrNull {
-                ((it as? Column<*>)?.columnType as? EntityIDColumnType<*>)?.idColumn == c
+            ?: fieldIndex.keys.firstOrNull { exp ->
+                when {
+//                    exp is Column<*> && exp.table is Alias<*> -> exp.table.delegate == c
+                    exp is Column<*> -> (exp.columnType as? EntityIDColumnType<*>)?.idColumn == c
+                    exp is ExpressionAlias<*> -> exp.delegate == c
+                    else -> false
+                }
             }?.let { fieldIndex[it] }
             ?: error("$c is not in record set")
 
@@ -80,11 +85,6 @@ class ResultRow(val fieldIndex: Map<Expression<*>, Int>) {
 
     companion object {
 
-        @Deprecated(level = DeprecationLevel.ERROR, message = "Consider to use [create] with map param instead")
-        fun create(rs: ResultSet, fields: List<Expression<*>>): ResultRow {
-            return create(rs, fields.distinct().mapIndexed { index, field -> field to index }.toMap())
-        }
-
         fun create(rs: ResultSet, fieldsIndex: Map<Expression<*>, Int>): ResultRow {
             return ResultRow(fieldsIndex).apply {
                 fieldsIndex.forEach { (field, index) ->
@@ -94,13 +94,19 @@ class ResultRow(val fieldIndex: Map<Expression<*>, Int>) {
             }
         }
 
-        fun createAndFillValues(data: Map<Expression<*>, Any?>): ResultRow =
-            ResultRow(data.keys.mapIndexed { i, c -> c to i }.toMap()).also { row ->
-                data.forEach { (c, v) -> row[c] = v }
+        fun createAndFillValues(data: Map<Expression<*>, Any?>): ResultRow {
+            val fieldIndex = HashMap<Expression<*>, Int>(data.size)
+            val values = arrayOfNulls<Any?>(data.size)
+            data.entries.forEachIndexed { i, columnAndValue ->
+                val (column, value) = columnAndValue
+                fieldIndex[column] = i
+                values[i] = value
             }
+            return ResultRow(fieldIndex, values)
+        }
 
         fun createAndFillDefaults(columns: List<Column<*>>): ResultRow =
-            ResultRow(columns.mapIndexed { i, c -> c to i }.toMap()).apply {
+            ResultRow(columns.withIndex().associate { it.value to it.index }).apply {
                 columns.forEach {
                     this[it] = it.defaultValueFun?.invoke() ?: if (!it.columnType.nullable) NotInitializedValue else null
                 }

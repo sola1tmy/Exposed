@@ -4,7 +4,6 @@ import org.jetbrains.exposed.dao.exceptions.EntityNotFoundException
 import org.jetbrains.exposed.dao.id.EntityID
 import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.transactions.TransactionManager
-import java.util.*
 import kotlin.properties.Delegates
 import kotlin.reflect.KProperty
 
@@ -26,6 +25,8 @@ open class Entity<ID : Comparable<ID>>(val id: EntityID<ID>) {
             _readValues!!
         }
 
+    private val referenceCache by lazy { HashMap<Column<*>, Any?>() }
+
     internal fun isNewEntity(): Boolean {
         val cache = TransactionManager.current().entityCache
         return cache.inserts[klass.table]?.contains(this) ?: false
@@ -39,7 +40,8 @@ open class Entity<ID : Comparable<ID>>(val id: EntityID<ID>) {
      * @throws EntityNotFoundException if entity no longer exists in database
      */
     open fun refresh(flush: Boolean = false) {
-        val cache = TransactionManager.current().entityCache
+        val transaction = TransactionManager.current()
+        val cache = transaction.entityCache
         val isNewEntity = isNewEntity()
         when {
             isNewEntity && flush -> cache.flushInserts(klass.table)
@@ -52,42 +54,99 @@ open class Entity<ID : Comparable<ID>>(val id: EntityID<ID>) {
         val reloaded = klass[id]
         cache.store(this)
         _readValues = reloaded.readValues
+        db = transaction.db
     }
 
-    operator fun <REF : Comparable<REF>, RID : Comparable<RID>, T : Entity<RID>> Reference<REF, RID, T>.getValue(o: Entity<ID>, desc: KProperty<*>): T {
+    internal fun <T> getReferenceFromCache(ref: Column<*>): T {
+        return referenceCache[ref] as T
+    }
+
+    internal fun storeReferenceInCache(ref: Column<*>, value: Any?) {
+        if (db.config.keepLoadedReferencesOutOfTransaction) {
+            referenceCache[ref] = value
+        }
+    }
+
+    operator fun <REF : Comparable<REF>, RID : Comparable<RID>, T : Entity<RID>> Reference<REF, RID, T>.getValue(
+        o: Entity<ID>,
+        desc: KProperty<*>
+    ): T {
+        val outOfTransaction = TransactionManager.currentOrNull() == null
+        if (outOfTransaction && reference in referenceCache) return getReferenceFromCache(reference)
         return executeAsPartOfEntityLifecycle {
             val refValue = reference.getValue(o, desc)
             when {
-                refValue is EntityID<*> && reference.referee<REF>() == factory.table.id -> factory.findById(refValue.value as RID)
-                else -> factory.findWithCacheCondition({ reference.referee!!.getValue(this, desc) == refValue }) { reference.referee<REF>()!! eq refValue }
-                    .singleOrNull()
+                refValue is EntityID<*> && reference.referee<REF>() == factory.table.id -> {
+                    factory.findById(refValue.value as RID).also {
+                        storeReferenceInCache(reference, it)
+                    }
+                }
+                else -> {
+                    // @formatter:off
+                    factory.findWithCacheCondition({
+                       reference.referee!!.getValue(this, desc) == refValue
+                    }) {
+                        reference.referee<REF>()!! eq refValue
+                    }.singleOrNull()?.also {
+                        storeReferenceInCache(reference, it)
+                    }
+                    // @formatter:on
+                }
             } ?: error("Cannot find ${factory.table.tableName} WHERE id=$refValue")
         }
     }
 
-    operator fun <REF : Comparable<REF>, RID : Comparable<RID>, T : Entity<RID>> Reference<REF, RID, T>.setValue(o: Entity<ID>, desc: KProperty<*>, value: T) {
+    operator fun <REF : Comparable<REF>, RID : Comparable<RID>, T : Entity<RID>> Reference<REF, RID, T>.setValue(
+        o: Entity<ID>,
+        desc: KProperty<*>,
+        value: T
+    ) {
         if (db != value.db) error("Can't link entities from different databases.")
         value.id.value // flush before creating reference on it
         val refValue = value.run { reference.referee<REF>()!!.getValue(this, desc) }
+        storeReferenceInCache(reference, value)
         reference.setValue(o, desc, refValue)
     }
 
-    operator fun <REF : Comparable<REF>, RID : Comparable<RID>, T : Entity<RID>> OptionalReference<REF, RID, T>.getValue(o: Entity<ID>, desc: KProperty<*>): T? {
+    operator fun <REF : Comparable<REF>, RID : Comparable<RID>, T : Entity<RID>> OptionalReference<REF, RID, T>.getValue(
+        o: Entity<ID>,
+        desc: KProperty<*>
+    ): T? {
+        val outOfTransaction = TransactionManager.currentOrNull() == null
+        if (outOfTransaction && reference in referenceCache) return getReferenceFromCache(reference)
         return executeAsPartOfEntityLifecycle {
             val refValue = reference.getValue(o, desc)
             when {
                 refValue == null -> null
-                refValue is EntityID<*> && reference.referee<REF>() == factory.table.id -> factory.findById(refValue.value as RID)
-                else -> factory.findWithCacheCondition({ reference.referee!!.getValue(this, desc) == refValue }) { reference.referee<REF>()!! eq refValue }
-                    .singleOrNull()
+                refValue is EntityID<*> && reference.referee<REF>() == factory.table.id -> {
+                    factory.findById(refValue.value as RID).also {
+                        storeReferenceInCache(reference, it)
+                    }
+                }
+                else -> {
+                    // @formatter:off
+                   factory.findWithCacheCondition({
+                       reference.referee!!.getValue(this, desc) == refValue
+                   }) {
+                       reference.referee<REF>()!! eq refValue
+                   }.singleOrNull().also {
+                       storeReferenceInCache(reference, it)
+                   }
+                    // @formatter:on
+                }
             }
         }
     }
 
-    operator fun <REF : Comparable<REF>, RID : Comparable<RID>, T : Entity<RID>> OptionalReference<REF, RID, T>.setValue(o: Entity<ID>, desc: KProperty<*>, value: T?) {
+    operator fun <REF : Comparable<REF>, RID : Comparable<RID>, T : Entity<RID>> OptionalReference<REF, RID, T>.setValue(
+        o: Entity<ID>,
+        desc: KProperty<*>,
+        value: T?
+    ) {
         if (value != null && db != value.db) error("Can't link entities from different databases.")
         value?.id?.value // flush before creating reference on it
         val refValue = value?.run { reference.referee<REF>()!!.getValue(this, desc) }
+        storeReferenceInCache(reference, value)
         reference.setValue(o, desc, refValue)
     }
 
@@ -100,10 +159,11 @@ open class Entity<ID : Comparable<ID>>(val id: EntityID<ID>) {
 
     @Suppress("UNCHECKED_CAST")
     fun <T, R : Any> Column<T>.lookupInReadValues(found: (T?) -> R?, notFound: () -> R?): R? =
-        if (_readValues?.hasValue(this) == true)
+        if (_readValues?.hasValue(this) == true) {
             found(readValues[this])
-        else
+        } else {
             notFound()
+        }
 
     @Suppress("UNCHECKED_CAST", "USELESS_CAST")
     fun <T> Column<T>.lookup(): T = when {
@@ -117,16 +177,19 @@ open class Entity<ID : Comparable<ID>>(val id: EntityID<ID>) {
         klass.invalidateEntityInCache(o)
         val currentValue = _readValues?.getOrNull(this)
         if (writeValues.containsKey(this as Column<out Any?>) || currentValue != value) {
+            val entityCache = TransactionManager.current().entityCache
             if (referee != null) {
-                val entityCache = TransactionManager.current().entityCache
                 if (value is EntityID<*> && value.table == referee!!.table) value.value // flush
 
                 listOfNotNull<Any>(value, currentValue).forEach {
-                    entityCache.referrers[it]?.remove(this)
+                    entityCache.referrers[this]?.remove(it)
                 }
-                entityCache.removeTablesReferrers(listOf(referee!!.table))
             }
             writeValues[this as Column<Any?>] = value
+            // TODO: Can this be simplified?
+            if (o.id._value?.let { entityCache.data[table]?.contains(it) } == true) {
+                entityCache.scheduleUpdate(klass, o)
+            }
         }
     }
 
@@ -148,7 +211,10 @@ open class Entity<ID : Comparable<ID>>(val id: EntityID<ID>) {
     infix fun <TID : Comparable<TID>, Target : Entity<TID>> EntityClass<TID, Target>.via(table: Table): InnerTableLink<ID, Entity<ID>, TID, Target> =
         InnerTableLink(table, this@via)
 
-    fun <TID : Comparable<TID>, Target : Entity<TID>> EntityClass<TID, Target>.via(sourceColumn: Column<EntityID<ID>>, targetColumn: Column<EntityID<TID>>) =
+    fun <TID : Comparable<TID>, Target : Entity<TID>> EntityClass<TID, Target>.via(
+        sourceColumn: Column<EntityID<ID>>,
+        targetColumn: Column<EntityID<TID>>
+    ) =
         InnerTableLink(sourceColumn.table, this@via, sourceColumn, targetColumn)
 
     /**
