@@ -346,7 +346,7 @@ interface ISqlExpressionBuilder {
     infix fun Expression<EntityID<String>>.notLike(pattern: String): NotLikeOp = NotLikeOp(this, stringParam(pattern))
 
     /** Checks if this expression doesn't match the specified [pattern]. */
-    infix fun <T : String?> Expression<T>.notLike(expression: ExpressionWithColumnType<String>): NotLikeOp = NotLikeOp(this, expression)
+    infix fun <T : String?> Expression<T>.notLike(expression: ExpressionWithColumnType<String>): NotLikeOp =    NotLikeOp(this, expression)
 
     /** Checks if this expression doesn't match the specified [pattern]. */
     @JvmName("notLikeWithEntityIDAndExpression")

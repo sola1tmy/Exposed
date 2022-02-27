@@ -113,12 +113,10 @@ class Column<T>(
             }
         }
 
-        if (colType.nullable || (defaultValue != null && defaultValueFun == null && !currentDialect.isAllowedAsColumnDefault(defaultValue))) {
-
         if (columnType.nullable || (defaultValue != null && defaultValueFun == null && !currentDialect.isAllowedAsColumnDefault(defaultValue))) {
             if (currentDialect !is DB2Dialect) // in db2 columns are null by default - there is no NULL keyword
                 append(" NULL")
-        } else if (!isPKColumn || (currentDialect is SQLiteDialect && !isSQLiteAutoIncColumn)) {
+        } else if (!isPKColumn || (currentDialect is DB2Dialect)|| (currentDialect is SQLiteDialect && !isSQLiteAutoIncColumn)) {
             append(" NOT NULL")
         }
         if (!modify && isOneColumnPK() && !isPrimaryConstraintWillBeDefined && !isSQLiteAutoIncColumn) {

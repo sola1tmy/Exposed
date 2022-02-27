@@ -12,7 +12,7 @@ import org.junit.Test
 
 class CreateIndexTests : DatabaseTestsBase() {
 
-    @Test
+     @Test
     fun createStandardIndex() {
         val TestTable = object : Table("test_table") {
             val id = integer("id")

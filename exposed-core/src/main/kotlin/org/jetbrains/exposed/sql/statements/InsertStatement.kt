@@ -152,7 +152,7 @@ open class InsertStatement<Key : Any>(val table: Table, val isIgnore: Boolean = 
 
         autoIncColumns.isNotEmpty() ->
             // http://viralpatel.net/blogs/oracle-java-jdbc-get-primary-key-insert-sql/
-            transaction.connection.prepareStatement(sql, autoIncColumns.map { it.name.inProperCase() }.toTypedArray())
+            transaction.connection.prepareStatement(sql, autoIncColumns.map { transaction.identity(it) }.toTypedArray())
 
         else -> transaction.connection.prepareStatement(sql, false)
     }

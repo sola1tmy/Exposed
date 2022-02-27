@@ -15,7 +15,7 @@ import org.junit.Test
 
 class DeleteTests : DatabaseTestsBase() {
     private val notSupportLimit by lazy {
-        val exclude = arrayListOf(TestDB.POSTGRESQL, TestDB.POSTGRESQLNG, TestDB.ORACLE)
+        val exclude = arrayListOf(TestDB.POSTGRESQL, TestDB.POSTGRESQLNG, TestDB.ORACLE, TestDB.DB2)
         if (!SQLiteDialect.ENABLE_UPDATE_DELETE_LIMIT) {
             exclude.add(TestDB.SQLITE)
         }
