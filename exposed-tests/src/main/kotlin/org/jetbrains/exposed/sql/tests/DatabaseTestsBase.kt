@@ -260,7 +260,7 @@ abstract class DatabaseTestsBase {
                     statement()
                     commit() // Need commit to persist data before drop schemas
                 } finally {
-                    val cascade = it != TestDB.SQLSERVER
+                    val cascade = it != TestDB.SQLSERVER && it != TestDB.DB2
                     SchemaUtils.dropSchema(*schemas, cascade = cascade)
                     commit()
                 }

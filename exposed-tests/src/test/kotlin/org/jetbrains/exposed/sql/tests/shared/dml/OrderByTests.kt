@@ -102,7 +102,10 @@ class OrderByTests : DatabaseTestsBase() {
 
     @Test
     fun testOrderByExpressions() {
-        withCitiesAndUsers { cities, users, userData ->
+        // https://www.ibm.com/docs/en/db2/11.5?topic=subselect-order-by-clause
+        // This said:The sort-key-expression cannot include a correlated scalar fullselect (SQLSTATE 42703)
+        // or a function with an external action (SQLSTATE 42845).
+        withCitiesAndUsers(listOf(TestDB.DB2)) { cities, users, userData ->
             val expression = wrapAsExpression<Int>(
                 users
                     .slice(users.id.count())
