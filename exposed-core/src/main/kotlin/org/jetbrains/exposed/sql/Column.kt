@@ -55,17 +55,51 @@ class Column<T>(
         }
 
     override fun createStatement(): List<String> {
-        val alterTablePrefix = "ALTER TABLE ${TransactionManager.current().identity(table)} ADD"
-        val isH2withCustomPKConstraint = currentDialect is H2Dialect && isLastColumnInPK
-        val columnDefinition = when {
-            isPrimaryConstraintWillBeDefined && isLastColumnInPK && !isH2withCustomPKConstraint ->
-                descriptionDdl(false) + ", ADD ${table.primaryKeyConstraint()}"
-            isH2withCustomPKConstraint -> descriptionDdl(true)
-            else -> descriptionDdl(false)
+        // https://stackoverflow.com/questions/35457306/db2-add-auto-increment-column-to-an-existing-table
+        when (currentDialect) {
+            is DB2Dialect -> {
+                val tr = TransactionManager.current()
+                val list = mutableListOf<String>()
+                val type = when {
+                    columnType is AutoIncColumnType -> columnType.delegate.sqlType()
+                    columnType is EntityIDColumnType<*> && columnType.idColumn.columnType is AutoIncColumnType -> {
+                        columnType.idColumn.columnType.delegate.sqlType()
+                    }
+                    else -> columnType.sqlType()
+                }
+                list.add(
+                    "ALTER TABLE ${TransactionManager.current().identity(table)} ADD ${tr.identity(this)} $type"
+                )
+                if (!columnType.nullable) {
+                    list.add("ALTER TABLE ${TransactionManager.current().identity(table)} ALTER COLUMN ${tr.identity(this)} SET NOT NULL")
+                }
+                if (columnType.isAutoInc) {
+                    list.add("ALTER TABLE ${TransactionManager.current().identity(table)} ALTER ${tr.identity(this)} " +
+                                 "SET GENERATED AS IDENTITY (START WITH 1, INCREMENT BY 1) ")
+                    list.add("CALL SYSPROC.ADMIN_CMD('REORG TABLE ${TransactionManager.current().identity(table)}')")
+                }
+                if (table.primaryKey?.columns?.contains(this)== true && isOneColumnPK()) {
+                    list.add("ALTER TABLE ${TransactionManager.current().identity(table)} ADD PRIMARY KEY (${tr.identity(this)})")
+                }
+                list.add("CALL SYSPROC.ADMIN_CMD('REORG TABLE ${TransactionManager.current().identity(table)}')")
+
+                return list
+            }
+            else -> {
+                val alterTablePrefix = "ALTER TABLE ${TransactionManager.current().identity(table)} ADD"
+                val isH2withCustomPKConstraint = currentDialect is H2Dialect && isLastColumnInPK
+                val columnDefinition = when {
+                    isPrimaryConstraintWillBeDefined && isLastColumnInPK && !isH2withCustomPKConstraint ->
+                        descriptionDdl(false) + ", ADD ${table.primaryKeyConstraint()}"
+                    isH2withCustomPKConstraint -> descriptionDdl(true)
+                    else -> descriptionDdl(false)
+                }
+
+                val addConstr = if (isH2withCustomPKConstraint) "$alterTablePrefix ${table.primaryKeyConstraint()}" else null
+                return listOfNotNull("$alterTablePrefix $columnDefinition", addConstr)
+            }
         }
 
-        val addConstr = if (isH2withCustomPKConstraint) "$alterTablePrefix ${table.primaryKeyConstraint()}" else null
-        return listOfNotNull("$alterTablePrefix $columnDefinition", addConstr)
     }
 
     fun modifyStatements(columnDiff: ColumnDiff): List<String> = currentDialect.modifyColumn(this, columnDiff)

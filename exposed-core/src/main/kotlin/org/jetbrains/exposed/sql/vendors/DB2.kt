@@ -152,6 +152,7 @@ class DB2Dialect : VendorDialect(dialectName, DB2DataTypeProvider, DB2FunctionPr
         }
     }
 
+
     override fun modifyColumn(column: Column<*>, columnDiff: ColumnDiff): List<String>  {
         val sqls = mutableListOf<String>()
         val identify = TransactionManager.current().identity(column)

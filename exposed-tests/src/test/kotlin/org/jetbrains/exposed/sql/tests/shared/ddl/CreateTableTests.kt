@@ -145,13 +145,16 @@ class CreateTableTests : DatabaseTestsBase() {
             val id1ProperName = Book.id.name.inProperCase()
             val ddlId1 = Book.id.ddl
 
-            if (currentDialectTest !is SQLiteDialect) {
-                assertEquals(
-                    "ALTER TABLE $tableProperName ADD ${Book.id.descriptionDdl(false)}, ADD CONSTRAINT $pkConstraintName PRIMARY KEY ($id1ProperName)",
-                    ddlId1.first()
-                )
-            } else {
-                assertEquals("ALTER TABLE $tableProperName ADD ${Book.id.descriptionDdl(false)}", ddlId1.first())
+            when (currentDialectTest) {
+                !is SQLiteDialect -> {
+                    assertEquals(
+                        "ALTER TABLE $tableProperName ADD ${Book.id.descriptionDdl(false)}, ADD CONSTRAINT $pkConstraintName PRIMARY KEY ($id1ProperName)",
+                        ddlId1.first()
+                    )
+                }
+                else -> {
+                    assertEquals("ALTER TABLE $tableProperName ADD ${Book.id.descriptionDdl(false)}", ddlId1.first())
+                }
             }
         }
     }

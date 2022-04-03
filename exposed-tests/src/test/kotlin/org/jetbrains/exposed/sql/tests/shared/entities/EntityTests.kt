@@ -13,6 +13,8 @@ import org.jetbrains.exposed.sql.tests.TestDB
 import org.jetbrains.exposed.sql.tests.shared.*
 import org.jetbrains.exposed.sql.transactions.TransactionManager
 import org.jetbrains.exposed.sql.transactions.inTopLevelTransaction
+import org.jetbrains.exposed.sql.vendors.DB2Dialect
+import org.jetbrains.exposed.sql.vendors.currentDialect
 import org.junit.Test
 import java.sql.Connection
 import java.util.*
@@ -212,7 +214,15 @@ class EntityTests : DatabaseTestsBase() {
     object Posts : LongIdTable(name = "posts") {
         val board = optReference("board", Boards.id)
         val parent = optReference("parent", this)
-        val category = optReference("category", Categories.uniqueId).uniqueIndex()
+        val category by lazy {
+            optReference("category", Categories.uniqueId).let {
+                if (currentDialect is DB2Dialect) {
+                    it
+                } else {
+                    it.uniqueIndex()
+                }
+            }
+        }
         val optCategory = optReference("optCategory", Categories.uniqueId)
     }
 
